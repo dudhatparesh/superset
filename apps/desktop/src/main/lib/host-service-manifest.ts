@@ -9,19 +9,19 @@ import {
 import { join } from "node:path";
 import { SUPERSET_HOME_DIR } from "./app-environment";
 
-/** Protocol version for the IPC contract between manager and host-service.
- *  Bump when the ready message shape, env contract, or health API
- *  changes in a backwards-incompatible way. */
-export const HOST_SERVICE_PROTOCOL_VERSION = 1;
-
 export interface HostServiceManifest {
 	pid: number;
 	endpoint: string;
 	authToken: string;
-	serviceVersion: string;
-	protocolVersion: number;
 	startedAt: number;
 	organizationId: string;
+	/**
+	 * Desktop app version that spawned this host-service. This is diagnostic
+	 * adoption context; a version mismatch alone must not kill a healthy
+	 * service because canary app timestamps can change without requiring a
+	 * host-service restart.
+	 */
+	spawnedByAppVersion: string;
 }
 
 export function manifestDir(organizationId: string): string {
@@ -61,12 +61,18 @@ export function readManifest(
 			typeof data.pid !== "number" ||
 			typeof data.endpoint !== "string" ||
 			typeof data.authToken !== "string" ||
-			typeof data.serviceVersion !== "string" ||
-			typeof data.protocolVersion !== "number" ||
 			typeof data.startedAt !== "number" ||
 			typeof data.organizationId !== "string"
 		) {
 			return null;
+		}
+
+		// `spawnedByAppVersion` is required going forward, but pre-existing
+		// manifests on upgraded users won't have it. Coerce to empty string so
+		// `tryAdopt` can log the provenance gap and still health-check the
+		// existing service before deciding whether to reuse it.
+		if (typeof data.spawnedByAppVersion !== "string") {
+			data.spawnedByAppVersion = "";
 		}
 
 		return data as HostServiceManifest;

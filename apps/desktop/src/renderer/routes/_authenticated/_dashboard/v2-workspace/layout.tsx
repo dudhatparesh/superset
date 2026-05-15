@@ -1,17 +1,16 @@
-import { and, eq } from "@tanstack/db";
+import { eq } from "@tanstack/db";
 import { useLiveQuery } from "@tanstack/react-db";
 import { createFileRoute, Outlet, useMatchRoute } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
-import { electronTrpc } from "renderer/lib/electron-trpc";
-import {
-	getHostServiceHeaders,
-	getHostServiceWsToken,
-} from "renderer/lib/host-service-auth";
-import { getRemoteHostUrl } from "renderer/lib/v2-workspace-host";
 import { useDashboardSidebarState } from "renderer/routes/_authenticated/hooks/useDashboardSidebarState";
 import { useCollections } from "renderer/routes/_authenticated/providers/CollectionsProvider";
-import { useHostService } from "renderer/routes/_authenticated/providers/HostServiceProvider";
-import { WorkspaceTrpcProvider } from "./providers/WorkspaceTrpcProvider";
+import { useWorkspaceCreatesStore } from "renderer/stores/workspace-creates";
+import { WorkspaceCreateErrorState } from "./components/WorkspaceCreateErrorState";
+import { WorkspaceCreatingState } from "./components/WorkspaceCreatingState";
+import { WorkspaceHostIncompatibleState } from "./components/WorkspaceHostIncompatibleState";
+import { WorkspaceNotFoundState } from "./components/WorkspaceNotFoundState";
+import { useRemoteHostStatus } from "./hooks/useRemoteHostStatus";
+import { WorkspaceProvider } from "./providers/WorkspaceProvider";
 
 export const Route = createFileRoute("/_authenticated/_dashboard/v2-workspace")(
 	{
@@ -27,46 +26,27 @@ function V2WorkspaceLayout() {
 	const workspaceId =
 		workspaceMatch !== false ? workspaceMatch.workspaceId : null;
 	const collections = useCollections();
-	const { services } = useHostService();
 	const { ensureWorkspaceInSidebar } = useDashboardSidebarState();
-	const { data: deviceInfo, isPending: isDeviceInfoPending } =
-		electronTrpc.auth.getDeviceInfo.useQuery();
 
-	const { data: workspaces = [] } = useLiveQuery(
+	const { data: workspaces, isReady } = useLiveQuery(
 		(q) =>
 			q
 				.from({ v2Workspaces: collections.v2Workspaces })
 				.where(({ v2Workspaces }) => eq(v2Workspaces.id, workspaceId ?? "")),
 		[collections, workspaceId],
 	);
-	const workspace = workspaces[0] ?? null;
-	const { data: hosts = [] } = useLiveQuery(
-		(q) =>
-			q
-				.from({ v2Hosts: collections.v2Hosts })
-				.where(({ v2Hosts }) =>
-					and(
-						eq(v2Hosts.machineId, deviceInfo?.deviceId ?? ""),
-						eq(v2Hosts.organizationId, workspace?.organizationId ?? ""),
-					),
-				),
-		[collections, deviceInfo?.deviceId, workspace?.organizationId],
+	const syncedWorkspace = workspaces?.[0] ?? null;
+	const inFlight = useWorkspaceCreatesStore((store) =>
+		workspaceId
+			? store.entries.find((entry) => entry.snapshot.id === workspaceId)
+			: undefined,
 	);
-	const localHost = hosts[0] ?? null;
-	const localHostUrl = workspace
-		? (services.get(workspace.organizationId)?.url ?? null)
-		: null;
-	const shouldWaitForDeviceInfo = workspace !== null && isDeviceInfoPending;
-	const isLocal = workspace?.hostId === localHost?.id;
-	const hostUrl =
-		!workspace || shouldWaitForDeviceInfo
-			? null
-			: isLocal
-				? localHostUrl
-				: getRemoteHostUrl(workspace.hostId);
+	// Fall back to the cloud row cached on the in-flight entry while
+	// Electric hasn't yet delivered the synced row. The cloud has already
+	// confirmed the workspace at this point — no need to block on sync.
+	const workspace = syncedWorkspace ?? inFlight?.cloudRow ?? null;
 
 	const lastEnsuredWorkspaceIdRef = useRef<string | null>(null);
-
 	useEffect(() => {
 		if (!workspace || lastEnsuredWorkspaceIdRef.current === workspace.id)
 			return;
@@ -74,35 +54,51 @@ function V2WorkspaceLayout() {
 		ensureWorkspaceInSidebar(workspace.id, workspace.projectId);
 	}, [ensureWorkspaceInSidebar, workspace]);
 
-	if (!workspaceId || !workspace) {
-		return <Outlet />;
+	const hostStatus = useRemoteHostStatus(workspace);
+
+	if (!workspaceId || !isReady || !workspaces) {
+		return <div className="flex h-full w-full" />;
 	}
 
-	if (shouldWaitForDeviceInfo) {
-		return (
-			<div className="flex h-full items-center justify-center text-muted-foreground">
-				Resolving workspace host...
-			</div>
-		);
+	if (!workspace) {
+		if (inFlight?.state === "creating") {
+			return (
+				<WorkspaceCreatingState
+					name={inFlight.snapshot.name}
+					branch={inFlight.snapshot.branch}
+					startedAt={inFlight.startedAt}
+				/>
+			);
+		}
+		if (inFlight?.state === "error") {
+			return (
+				<WorkspaceCreateErrorState
+					workspaceId={workspaceId}
+					name={inFlight.snapshot.name}
+					branch={inFlight.snapshot.branch}
+					error={inFlight.error ?? "Unknown error"}
+				/>
+			);
+		}
+		return <WorkspaceNotFoundState workspaceId={workspaceId} />;
 	}
 
-	if (!hostUrl) {
+	if (hostStatus.status === "incompatible") {
 		return (
-			<div className="flex h-full items-center justify-center text-muted-foreground">
-				Workspace host service not available
-			</div>
+			<WorkspaceHostIncompatibleState
+				hostName={hostStatus.hostName}
+				hostVersion={hostStatus.hostVersion}
+				minVersion={hostStatus.minVersion}
+			/>
 		);
+	}
+	if (hostStatus.status === "loading") {
+		return <div className="flex h-full w-full" />;
 	}
 
 	return (
-		<WorkspaceTrpcProvider
-			cacheKey={workspace.id}
-			key={`${workspace.id}:${hostUrl}`}
-			hostUrl={hostUrl}
-			headers={() => getHostServiceHeaders(hostUrl)}
-			wsToken={() => getHostServiceWsToken(hostUrl)}
-		>
+		<WorkspaceProvider workspace={workspace}>
 			<Outlet />
-		</WorkspaceTrpcProvider>
+		</WorkspaceProvider>
 	);
 }

@@ -13,9 +13,11 @@ import {
 import { makeAppSetup } from "lib/electron-app/factories/app/setup";
 import {
 	handleAuthCallback,
+	loadToken,
 	parseAuthDeepLink,
 } from "lib/trpc/routers/auth/utils/auth-functions";
 import { applyShellEnvToProcess } from "lib/trpc/routers/workspaces/utils/shell-env";
+import { env as mainEnv } from "main/env.main";
 import {
 	DEFAULT_CONFIRM_ON_QUIT,
 	PLATFORM,
@@ -25,18 +27,29 @@ import { setupAgentHooks } from "./lib/agent-setup";
 import { initAppState } from "./lib/app-state";
 import { requestAppleEventsAccess } from "./lib/apple-events-permission";
 import { setupAutoUpdater } from "./lib/auto-updater";
+import { installBundledCliShim } from "./lib/bundled-cli";
 import { resolveDevWorkspaceName } from "./lib/dev-workspace-name";
 import { setWorkspaceDockIcon } from "./lib/dock-icon";
 import { loadWebviewBrowserExtension } from "./lib/extensions";
-import { getHostServiceManager } from "./lib/host-service-manager";
+import { getHostServiceCoordinator } from "./lib/host-service-coordinator";
 import { localDb } from "./lib/local-db";
+import { requestLocalNetworkAccess } from "./lib/local-network-permission";
+import {
+	initTanstackDbPersistence,
+	shutdownTanstackDbPersistence,
+} from "./lib/persistence/persistence";
 import { ensureProjectIconsDir, getProjectIconPath } from "./lib/project-icons";
 import { initSentry } from "./lib/sentry";
 import {
 	prewarmTerminalRuntime,
 	reconcileDaemonSessions,
 } from "./lib/terminal";
+import {
+	disposeTerminalHostClient,
+	getTerminalHostClient,
+} from "./lib/terminal-host/client";
 import { disposeTray, initTray } from "./lib/tray";
+import { startNetworkLogger, stopNetworkLogger } from "./network-logger";
 import { MainWindow } from "./windows/main";
 
 console.log("[main] Local database ready:", !!localDb);
@@ -152,9 +165,21 @@ app.on("open-url", async (event, url) => {
 
 let isQuitting = false;
 let skipQuitConfirmation = false;
+let forceFullCleanup = false;
+
+export function setSkipQuitConfirmation(): void {
+	skipQuitConfirmation = true;
+}
 
 export function quitApp(): void {
-	skipQuitConfirmation = true;
+	setSkipQuitConfirmation();
+	app.quit();
+}
+
+/** Nuclear quit: also kills host-service(s) and pty-daemon/terminal-host. */
+export function quitAppCompletely(): void {
+	forceFullCleanup = true;
+	setSkipQuitConfirmation();
 	app.quit();
 }
 
@@ -199,13 +224,36 @@ app.on("before-quit", async (event) => {
 
 	isQuitting = true;
 	try {
-		getHostServiceManager().releaseAll();
+		if (isDev || forceFullCleanup) {
+			await runDevQuitCleanup();
+		} else {
+			// Prod: leave services running so the next launch re-adopts via manifest.
+			getHostServiceCoordinator().releaseAll();
+		}
+		shutdownTanstackDbPersistence();
 		disposeTray();
 	} catch (error) {
 		console.error("[main] Cleanup during quit failed:", error);
+	} finally {
+		await stopNetworkLogger();
 	}
 	app.exit(0);
 });
+
+/**
+ * Full cleanup — kill host-service + terminal-host children. Used in dev (where
+ * they'd reparent to init without an explicit stop) and on the tray's
+ * "Quit Superset Completely" path in prod.
+ */
+async function runDevQuitCleanup(): Promise<void> {
+	getHostServiceCoordinator().stopAll();
+	try {
+		await getTerminalHostClient().shutdownIfRunning({ killSessions: true });
+	} catch (err) {
+		console.warn("[main] terminal-host dev shutdown failed:", err);
+	}
+	disposeTerminalHostClient();
+}
 
 process.on("uncaughtException", (error) => {
 	if (isQuitting) return;
@@ -219,9 +267,14 @@ process.on("unhandledRejection", (reason) => {
 
 // Without these handlers, Electron may not quit when electron-vite sends SIGTERM
 if (process.env.NODE_ENV === "development") {
+	let signalHandled = false;
 	const handleTerminationSignal = (signal: string) => {
+		if (signalHandled) return;
+		signalHandled = true;
 		console.log(`[main] Received ${signal}, quitting...`);
-		app.exit(0);
+		void Promise.allSettled([runDevQuitCleanup(), stopNetworkLogger()]).finally(
+			() => app.exit(0),
+		);
 	};
 
 	process.on("SIGTERM", () => handleTerminationSignal("SIGTERM"));
@@ -242,7 +295,7 @@ if (process.env.NODE_ENV === "development") {
 		if (!isParentAlive()) {
 			console.log("[main] Parent process exited, quitting...");
 			clearInterval(parentCheckInterval);
-			app.exit(0);
+			handleTerminationSignal("parent-exit");
 		}
 	}, 1000);
 	parentCheckInterval.unref();
@@ -287,6 +340,7 @@ if (!gotTheLock) {
 		await app.whenReady();
 		registerWithMacOSNotificationCenter();
 		requestAppleEventsAccess();
+		requestLocalNetworkAccess();
 
 		// Must register on both default session and the app's custom partition
 		const iconProtocolHandler = (request: Request) => {
@@ -337,6 +391,13 @@ if (!gotTheLock) {
 		setWorkspaceDockIcon();
 		initSentry();
 		await initAppState();
+		initTanstackDbPersistence();
+
+		try {
+			await startNetworkLogger();
+		} catch (error) {
+			console.error("[main] Failed to start network logger:", error);
+		}
 
 		await loadWebviewBrowserExtension();
 
@@ -349,10 +410,23 @@ if (!gotTheLock) {
 		} catch (error) {
 			console.error("[main] Failed to set up agent hooks:", error);
 		}
+		try {
+			installBundledCliShim();
+		} catch (error) {
+			console.error("[main] Failed to install bundled CLI shim:", error);
+		}
 
 		// Discover and adopt host-services that survived a previous quit
 		// before the tray initializes, so it shows accurate status immediately.
-		await getHostServiceManager().discoverAndAdoptAll();
+		await getHostServiceCoordinator().discoverAll();
+
+		if (IS_DEV) {
+			getHostServiceCoordinator().enableDevReload(async () => {
+				const { token } = await loadToken();
+				if (!token) return null;
+				return { authToken: token, cloudApiUrl: mainEnv.NEXT_PUBLIC_API_URL };
+			});
+		}
 
 		await makeAppSetup(() => MainWindow());
 		setupAutoUpdater();

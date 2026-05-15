@@ -1,124 +1,109 @@
 /**
  * Workspace Service — Desktop Entry Point
  *
- * Run with: ELECTRON_RUN_AS_NODE=1 electron dist/main/host-service.js
- *
- * Starts the host-service HTTP server on a random local port.
- * The parent Electron process reads the port from the IPC channel.
- *
- * When KEEP_ALIVE_AFTER_PARENT=1, the service stays running even if the
- * parent Electron process exits (out-of-app durability mode).
+ * Starts the host-service HTTP server on a port assigned by the coordinator.
+ * The coordinator polls health.check to know when it's ready.
  */
 
 import { serve } from "@hono/node-server";
 import {
 	createApp,
+	installProcessSafetyNet,
 	JwtApiAuthProvider,
 	LocalGitCredentialProvider,
+	LocalModelProvider,
 	PskHostAuthProvider,
 } from "@superset/host-service";
 import {
 	initTerminalBaseEnv,
 	resolveTerminalBaseEnv,
 } from "@superset/host-service/terminal-env";
-import {
-	HOST_SERVICE_PROTOCOL_VERSION,
-	removeManifest,
-	writeManifest,
-} from "main/lib/host-service-manifest";
+import { connectRelay } from "@superset/host-service/tunnel";
+import { loadToken } from "lib/trpc/routers/auth/utils/auth-functions";
+import { writeManifest } from "main/lib/host-service-manifest";
+import { env } from "./env";
 
 async function main(): Promise<void> {
 	const terminalBaseEnv = await resolveTerminalBaseEnv();
 	initTerminalBaseEnv(terminalBaseEnv);
 
-	const authToken = process.env.AUTH_TOKEN;
-	const cloudApiUrl = process.env.CLOUD_API_URL;
-	const dbPath = process.env.HOST_DB_PATH;
-	const deviceClientId = process.env.DEVICE_CLIENT_ID;
-	const deviceName = process.env.DEVICE_NAME;
-	const hostServiceSecret = process.env.HOST_SERVICE_SECRET;
-	const serviceVersion = process.env.HOST_SERVICE_VERSION ?? null;
-	const protocolVersion = HOST_SERVICE_PROTOCOL_VERSION;
-	const organizationId = process.env.ORGANIZATION_ID ?? "";
-	const desktopVitePort = process.env.DESKTOP_VITE_PORT ?? "5173";
-	const keepAliveAfterParent = process.env.KEEP_ALIVE_AFTER_PARENT === "1";
+	const authProvider = new JwtApiAuthProvider({
+		// Read fresh from disk every time we need to mint a new JWT, so that
+		// re-logins in the desktop renderer (which rewrites auth-token.enc)
+		// are picked up without restarting the host-service child. Falls back
+		// to the boot-time token if the file is missing for any reason.
+		getSessionToken: async () => {
+			const { token } = await loadToken();
+			return token ?? env.AUTH_TOKEN;
+		},
+		apiUrl: env.SUPERSET_API_URL,
+	});
 
-	const auth =
-		authToken && cloudApiUrl ? new JwtApiAuthProvider(authToken) : undefined;
-	const hostAuth = hostServiceSecret
-		? new PskHostAuthProvider(hostServiceSecret)
-		: undefined;
-
-	const { app, injectWebSocket } = createApp({
-		credentials: new LocalGitCredentialProvider(),
-		auth,
-		hostAuth,
-		cloudApiUrl,
-		dbPath,
-		deviceClientId,
-		deviceName,
-		serviceVersion,
-		protocolVersion,
-		allowedOrigins: [
-			`http://localhost:${desktopVitePort}`,
-			`http://127.0.0.1:${desktopVitePort}`,
-		],
+	const { app, injectWebSocket, api } = createApp({
+		config: {
+			organizationId: env.ORGANIZATION_ID,
+			dbPath: env.HOST_DB_PATH,
+			cloudApiUrl: env.SUPERSET_API_URL,
+			migrationsFolder: env.HOST_MIGRATIONS_FOLDER,
+			allowedOrigins: [
+				`http://localhost:${env.DESKTOP_VITE_PORT}`,
+				`http://127.0.0.1:${env.DESKTOP_VITE_PORT}`,
+			],
+			hostServiceSecret: env.HOST_SERVICE_SECRET,
+		},
+		providers: {
+			auth: authProvider,
+			hostAuth: new PskHostAuthProvider(env.HOST_SERVICE_SECRET),
+			credentials: new LocalGitCredentialProvider(),
+			modelResolver: new LocalModelProvider(),
+		},
 	});
 
 	const startedAt = Date.now();
 	const server = serve(
-		{ fetch: app.fetch, port: 0, hostname: "127.0.0.1" },
+		{ fetch: app.fetch, port: env.HOST_SERVICE_PORT, hostname: "127.0.0.1" },
 		(info: { port: number }) => {
-			if (organizationId) {
+			// Install only after the server is listening so startup throws still
+			// reach `main().catch(...)` and exit with a non-zero code.
+			installProcessSafetyNet();
+
+			if (env.ORGANIZATION_ID) {
 				try {
 					writeManifest({
 						pid: process.pid,
 						endpoint: `http://127.0.0.1:${info.port}`,
-						authToken: hostServiceSecret ?? "",
-						serviceVersion: serviceVersion ?? "",
-						protocolVersion: protocolVersion ?? 0,
+						authToken: env.HOST_SERVICE_SECRET,
 						startedAt,
-						organizationId,
+						organizationId: env.ORGANIZATION_ID,
+						spawnedByAppVersion: env.SUPERSET_APP_VERSION,
 					});
 				} catch (error) {
 					console.error("[host-service] Failed to write manifest:", error);
 				}
 			}
-			process.send?.({
-				type: "ready",
-				port: info.port,
-				serviceVersion,
-				protocolVersion,
-				startedAt,
-			});
+
+			if (env.RELAY_URL && env.ORGANIZATION_ID) {
+				void connectRelay({
+					api,
+					relayUrl: env.RELAY_URL,
+					localPort: info.port,
+					organizationId: env.ORGANIZATION_ID,
+					authProvider,
+					hostServiceSecret: env.HOST_SERVICE_SECRET,
+				});
+			}
 		},
 	);
 	injectWebSocket(server);
 
+	// Manifest lifecycle belongs to the coordinator, not the child.
 	const shutdown = () => {
-		if (organizationId) {
-			removeManifest(organizationId);
-		}
 		server.close();
 		process.exit(0);
 	};
 
 	process.on("SIGTERM", shutdown);
 	process.on("SIGINT", shutdown);
-
-	if (!keepAliveAfterParent) {
-		const parentPid = process.ppid;
-		const parentCheck = setInterval(() => {
-			try {
-				process.kill(parentPid, 0);
-			} catch {
-				clearInterval(parentCheck);
-				console.log("[host-service] Parent process exited, shutting down");
-				shutdown();
-			}
-		}, 2000);
-		parentCheck.unref();
-	}
 }
 
 void main().catch((error) => {

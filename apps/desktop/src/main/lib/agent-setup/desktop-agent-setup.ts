@@ -1,5 +1,6 @@
 import {
 	cleanupGlobalOpenCodePlugin,
+	createAmpPlugin,
 	createAmpWrapper,
 	createClaudeSettingsJson,
 	createClaudeWrapper,
@@ -19,6 +20,7 @@ import {
 	createMastraWrapper,
 	createOpenCodePlugin,
 	createOpenCodeWrapper,
+	createPiExtension,
 } from "./agent-wrappers";
 import {
 	DESKTOP_AGENT_SETUP_BOOTSTRAP_ACTIONS,
@@ -31,6 +33,7 @@ const DESKTOP_AGENT_SETUP_RUNNERS: Record<DesktopAgentSetupAction, () => void> =
 	{
 		"notify-script": createNotifyScript,
 		"cleanup-global-opencode-plugin": cleanupGlobalOpenCodePlugin,
+		"amp-plugin": createAmpPlugin,
 		"amp-wrapper": createAmpWrapper,
 		"claude-settings-json": createClaudeSettingsJson,
 		"claude-wrapper": createClaudeWrapper,
@@ -40,6 +43,7 @@ const DESKTOP_AGENT_SETUP_RUNNERS: Record<DesktopAgentSetupAction, () => void> =
 		"droid-settings-json": createDroidSettingsJson,
 		"opencode-plugin": createOpenCodePlugin,
 		"opencode-wrapper": createOpenCodeWrapper,
+		"pi-extension": createPiExtension,
 		"cursor-hook-script": createCursorHookScript,
 		"cursor-agent-wrapper": createCursorAgentWrapper,
 		"cursor-hooks-json": createCursorHooksJson,

@@ -20,14 +20,9 @@ import { getTrustedVercelPreviewOrigins } from "@superset/shared/vercel-preview-
 import { Client } from "@upstash/qstash";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import {
-	bearer,
-	customSession,
-	deviceAuthorization,
-	organization,
-} from "better-auth/plugins";
+import { bearer, customSession, organization } from "better-auth/plugins";
 import { jwt } from "better-auth/plugins/jwt";
-import { and, count, desc, eq, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type Stripe from "stripe";
 import { env } from "./env";
 import { acceptInvitationEndpoint } from "./lib/accept-invitation-endpoint";
@@ -207,7 +202,13 @@ export const auth = betterAuth({
 			consentPage: `${env.NEXT_PUBLIC_WEB_URL}/oauth/consent`,
 			allowDynamicClientRegistration: true,
 			allowUnauthenticatedClientRegistration: true,
-			validAudiences: [env.NEXT_PUBLIC_API_URL, `${env.NEXT_PUBLIC_API_URL}/`],
+			accessTokenExpiresIn: 60 * 60 * 24 * 7,
+			validAudiences: [
+				env.NEXT_PUBLIC_API_URL,
+				`${env.NEXT_PUBLIC_API_URL}/`,
+				`${env.NEXT_PUBLIC_API_URL}/api/agent/mcp`,
+				`${env.NEXT_PUBLIC_API_URL}/api/v2/agent/mcp`,
+			],
 			silenceWarnings: {
 				oauthAuthServerConfig: true,
 				openidConfig: true,
@@ -225,14 +226,62 @@ export const auth = betterAuth({
 					return activeOrganizationId ?? undefined;
 				},
 			},
-			customAccessTokenClaims: ({ referenceId }) => ({
-				organizationId: referenceId ?? undefined,
-			}),
+			customAccessTokenClaims: async ({ user, referenceId, metadata }) => {
+				const clientName =
+					metadata && typeof metadata === "object" && "client_name" in metadata
+						? metadata.client_name
+						: undefined;
+				// Mirror the JWT plugin's `definePayload` so OAuth access tokens
+				// carry the user's full membership list. Without this, every
+				// `ctx.organizationIds.includes(...)` check downstream rejects
+				// the token because the claim defaults to `[]`.
+				const memberRows = user?.id
+					? await db.query.members.findMany({
+							where: eq(members.userId, user.id),
+							columns: { organizationId: true },
+						})
+					: [];
+				const organizationIds = [
+					...new Set(memberRows.map((m) => m.organizationId)),
+				];
+				return {
+					organizationId: referenceId ?? undefined,
+					organizationIds,
+					client_name: typeof clientName === "string" ? clientName : undefined,
+				};
+			},
 		}),
 		expo(),
 		organization({
 			creatorRole: "owner",
 			invitationExpiresIn: 60 * 60 * 24 * 7,
+			teams: {
+				enabled: true,
+				maximumTeams: 25,
+				allowRemovingAllTeams: false,
+				defaultTeam: {
+					enabled: true,
+					customCreateDefaultTeam: async (organization) => {
+						const [team] = await db
+							.insert(authSchema.teams)
+							.values({
+								name: "Default Team",
+								slug: "DEFAULT",
+								organizationId: organization.id,
+							})
+							.returning();
+						if (!team) throw new Error("Failed to create default team");
+						return { ...team, updatedAt: team.updatedAt ?? undefined };
+					},
+				},
+			},
+			schema: {
+				team: {
+					additionalFields: {
+						slug: { type: "string", input: true, required: true },
+					},
+				},
+			},
 			sendInvitationEmail: async (data) => {
 				const token = await generateMagicTokenForInvite({
 					invitationId: data.id,
@@ -261,7 +310,7 @@ export const auth = betterAuth({
 			},
 			organizationHooks: {
 				beforeCreateInvitation: async (data) => {
-					const { inviterId, organizationId, role } = data.invitation;
+					const { inviterId, organizationId, role, teamId } = data.invitation;
 
 					const { success } = await invitationRateLimit.limit(inviterId);
 					if (!success) {
@@ -289,6 +338,19 @@ export const auth = betterAuth({
 					) {
 						throw new Error("Cannot invite users with this role");
 					}
+
+					if (!teamId) {
+						const oldestTeam = await db.query.teams.findFirst({
+							where: eq(authSchema.teams.organizationId, organizationId),
+							orderBy: asc(authSchema.teams.createdAt),
+							columns: { id: true },
+						});
+						if (oldestTeam) {
+							return {
+								data: { ...data.invitation, teamId: oldestTeam.id },
+							};
+						}
+					}
 				},
 
 				afterCreateOrganization: async ({ organization, user }) => {
@@ -307,6 +369,96 @@ export const auth = betterAuth({
 						.where(eq(authSchema.organizations.id, organization.id));
 
 					await seedDefaultStatuses(organization.id);
+				},
+
+				beforeRemoveMember: async ({ member, organization }) => {
+					await db
+						.delete(authSchema.teamMembers)
+						.where(
+							and(
+								eq(authSchema.teamMembers.userId, member.userId),
+								inArray(
+									authSchema.teamMembers.teamId,
+									db
+										.select({ id: authSchema.teams.id })
+										.from(authSchema.teams)
+										.where(
+											eq(authSchema.teams.organizationId, organization.id),
+										),
+								),
+							),
+						);
+				},
+
+				beforeRemoveTeamMember: async ({ teamMember, organization }) => {
+					// Invariant: every org member belongs to ≥1 team. Reject the
+					// removal if it would leave this user with zero teams in this
+					// org. Self-leave and admin-removal both flow through this hook.
+					const [otherMemberships] = await db
+						.select({ value: count() })
+						.from(authSchema.teamMembers)
+						.where(
+							and(
+								eq(authSchema.teamMembers.userId, teamMember.userId),
+								eq(authSchema.teamMembers.organizationId, organization.id),
+								ne(authSchema.teamMembers.teamId, teamMember.teamId),
+							),
+						);
+					if ((otherMemberships?.value ?? 0) === 0) {
+						throw new Error("You should be a member of at least one team");
+					}
+				},
+
+				beforeDeleteTeam: async ({ team }) => {
+					// Linear-style: deleting a team would otherwise orphan any
+					// members who were only in this team. Re-home them into the
+					// next-oldest team in the org before the FK cascade fires.
+					const teamMemberRows = await db
+						.select({ userId: authSchema.teamMembers.userId })
+						.from(authSchema.teamMembers)
+						.where(eq(authSchema.teamMembers.teamId, team.id));
+
+					if (teamMemberRows.length === 0) return;
+
+					const memberUserIds = teamMemberRows.map((row) => row.userId);
+
+					const safelyInOtherTeam = await db
+						.select({ userId: authSchema.teamMembers.userId })
+						.from(authSchema.teamMembers)
+						.where(
+							and(
+								inArray(authSchema.teamMembers.userId, memberUserIds),
+								eq(authSchema.teamMembers.organizationId, team.organizationId),
+								ne(authSchema.teamMembers.teamId, team.id),
+							),
+						);
+					const safeUserIds = new Set(safelyInOtherTeam.map((r) => r.userId));
+					const orphanUserIds = memberUserIds.filter(
+						(uid) => !safeUserIds.has(uid),
+					);
+
+					if (orphanUserIds.length === 0) return;
+
+					const nextTeam = await db.query.teams.findFirst({
+						where: and(
+							eq(authSchema.teams.organizationId, team.organizationId),
+							ne(authSchema.teams.id, team.id),
+						),
+						orderBy: asc(authSchema.teams.createdAt),
+						columns: { id: true },
+					});
+					if (!nextTeam) return;
+
+					await db
+						.insert(authSchema.teamMembers)
+						.values(
+							orphanUserIds.map((userId) => ({
+								teamId: nextTeam.id,
+								userId,
+								organizationId: team.organizationId,
+							})),
+						)
+						.onConflictDoNothing();
 				},
 
 				beforeDeleteOrganization: async ({ organization }) => {
@@ -329,7 +481,23 @@ export const auth = betterAuth({
 					});
 				},
 
-				beforeAddMember: async ({ organization }) => {
+				beforeAddMember: async ({ organization, user }) => {
+					// Domain-allowlisted users bypass the free-plan member limit.
+					// If an admin put the user's domain in allowedDomains, they've
+					// already explicitly opted in to letting those users join.
+					// (allowedDomains isn't on the hook's organization arg because
+					// it isn't declared as a better-auth additionalField — fetch it.)
+					const userDomain = user.email.split("@")[1]?.toLowerCase();
+					if (userDomain) {
+						const orgRow = await db.query.organizations.findFirst({
+							where: eq(authSchema.organizations.id, organization.id),
+							columns: { allowedDomains: true },
+						});
+						if (orgRow?.allowedDomains?.includes(userDomain)) {
+							return;
+						}
+					}
+
 					const subscription = await db.query.subscriptions.findFirst({
 						where: and(
 							eq(subscriptions.referenceId, organization.id),
@@ -354,6 +522,28 @@ export const auth = betterAuth({
 				},
 
 				afterAddMember: async ({ member, user, organization }) => {
+					// Linear-style: auto-add new org members to the oldest team so
+					// they aren't dropped into an empty teams view. Additional team
+					// memberships are added explicitly by admins.
+					const defaultTeam = await db.query.teams.findFirst({
+						where: eq(authSchema.teams.organizationId, organization.id),
+						orderBy: asc(authSchema.teams.createdAt),
+						columns: { id: true },
+					});
+					if (defaultTeam) {
+						// onConflictDoNothing keeps addMember robust if a stale row
+						// ever exists from a partial earlier run — we never want this
+						// hook to fail a member-add.
+						await db
+							.insert(authSchema.teamMembers)
+							.values({
+								teamId: defaultTeam.id,
+								userId: member.userId,
+								organizationId: organization.id,
+							})
+							.onConflictDoNothing();
+					}
+
 					const subscription = await db.query.subscriptions.findFirst({
 						where: and(
 							eq(subscriptions.referenceId, organization.id),
@@ -547,9 +737,6 @@ export const auth = betterAuth({
 				},
 			},
 		}),
-		deviceAuthorization({
-			verificationUri: `${env.NEXT_PUBLIC_WEB_URL}/device`,
-		}),
 		bearer(),
 		customSession(async ({ user, session: baseSession }) => {
 			const session = baseSession as typeof sessions.$inferSelect;
@@ -640,7 +827,11 @@ export const auth = betterAuth({
 					}
 				},
 
-				getCheckoutSessionParams: async ({ user, plan, subscription }) => {
+				getCheckoutSessionParams: async (
+					{ user, plan, subscription },
+					_request,
+					ctx,
+				) => {
 					if (plan.name === "enterprise") {
 						throw new Error(
 							"Enterprise subscriptions are managed by admins. Contact founders@superset.sh.",
@@ -654,10 +845,14 @@ export const auth = betterAuth({
 						),
 					});
 
+					const annual = Boolean(
+						(ctx?.body as { annual?: boolean } | undefined)?.annual,
+					);
+
 					return {
 						params: {
 							customer: org?.stripeCustomerId ?? undefined,
-							allow_promotion_codes: true,
+							allow_promotion_codes: !annual,
 							billing_address_collection: "required",
 							metadata: {
 								organizationId: org?.id ?? "",
@@ -918,3 +1113,40 @@ export const auth = betterAuth({
 
 export type Session = typeof auth.$Infer.Session;
 export type User = typeof auth.$Infer.Session.user;
+
+/**
+ * Mints a short-lived JWT signed with the same JWKS key the Better Auth JWT
+ * plugin uses for session-derived tokens. Used by headless service code
+ * (e.g. the automations dispatcher) that needs to act on behalf of a user
+ * without holding their session cookie.
+ *
+ * The resulting token is accepted by anything that verifies via the public
+ * JWKS endpoint (the relay and any other downstream service), because it is
+ * signed with the same RS256 key pair.
+ */
+export async function mintUserJwt(args: {
+	userId: string;
+	email?: string;
+	organizationIds: string[];
+	scope?: string;
+	runId?: string;
+	/** Token lifetime in seconds. Default 300 (5 minutes). */
+	ttlSeconds?: number;
+}): Promise<string> {
+	const exp = Math.floor(Date.now() / 1000) + (args.ttlSeconds ?? 300);
+
+	const response = await auth.api.signJWT({
+		body: {
+			payload: {
+				sub: args.userId,
+				email: args.email,
+				organizationIds: args.organizationIds,
+				scope: args.scope,
+				runId: args.runId,
+				exp,
+			},
+		},
+	});
+
+	return response.token;
+}

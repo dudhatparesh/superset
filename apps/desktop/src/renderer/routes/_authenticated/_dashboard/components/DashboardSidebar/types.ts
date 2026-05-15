@@ -3,6 +3,8 @@ export type DashboardSidebarWorkspaceHostType =
 	| "remote-device"
 	| "cloud";
 
+export type DashboardSidebarWorkspaceType = "main" | "worktree";
+
 export interface DashboardSidebarWorkspacePullRequestCheck {
 	name: string;
 	status: "success" | "failure" | "pending" | "skipped" | "cancelled";
@@ -25,6 +27,8 @@ export interface DashboardSidebarWorkspace {
 	projectId: string;
 	hostId: string;
 	hostType: DashboardSidebarWorkspaceHostType;
+	type: DashboardSidebarWorkspaceType;
+	hostIsOnline: boolean | null;
 	accentColor: string | null;
 	name: string;
 	branch: string;
@@ -36,7 +40,8 @@ export interface DashboardSidebarWorkspace {
 	behindCount: number | null;
 	createdAt: Date;
 	updatedAt: Date;
-	creationStatus?: "preparing" | "generating-branch" | "creating";
+	taskId: string | null;
+	creationStatus?: "preparing" | "generating-branch" | "creating" | "failed";
 }
 
 export interface DashboardSidebarSection {
@@ -67,6 +72,7 @@ export interface DashboardSidebarProject {
 	githubRepositoryId: string | null;
 	githubOwner: string | null;
 	githubRepoName: string | null;
+	iconUrl: string | null;
 	createdAt: Date;
 	updatedAt: Date;
 	isCollapsed: boolean;
